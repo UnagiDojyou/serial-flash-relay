@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Logs / build artifacts
+*.log
+build/
+
+# Firmware images (pass host paths to the flash API instead)
+*.bin
+*.uf2
+*.elf
