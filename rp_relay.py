@@ -20,8 +20,10 @@ Two services in one process (pure stdlib, Linux only):
      never become readable (select() just blocks, no EIO/EOF), so the node
      identity is also polled while the session runs.
 
-  2. HTTP FLASH API  http://127.0.0.1:8000  (auto-increments; paired with TCP)
+  2. HTTP FLASH / RESET API  http://127.0.0.1:8000
+     (auto-increments; paired with TCP)
        GET  /health
+       POST /reset  {"mode": "run"}      # run | bootsel (picotool)
        POST /flash  {"file": "/abs/path/firmware.uf2",
                      "method": "auto"}          # auto | picotool | storage
 
@@ -92,7 +94,7 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_TCP = 4000
 DEFAULT_HTTP = 8000
@@ -939,6 +941,56 @@ def picotool_flash(exe: str, kind: str, firmware: str) -> str:
     raise FlashError("\n".join(parts) + "\nERROR: picotool load failed")
 
 
+def picotool_reboot_cmd(exe: str, kind: str, bootsel: bool,
+                        force: bool = True):
+    """Build `picotool reboot` for the Rust (pqt) or legacy Python tool."""
+    if kind == "rust":
+        cmd = [exe, "reboot"]
+        if force:
+            cmd.append("--force")
+    else:
+        cmd = [exe]
+        if force:
+            cmd.append("--force")
+        cmd.append("reboot")
+    if bootsel:
+        cmd.append("--usb")
+    return cmd
+
+
+def picotool_reset(exe: str, kind: str, bootsel: bool) -> str:
+    """Reboot the board via the picotool reset interface.
+
+    Tries --force first (running firmware that exposes the reset interface)
+    and retries without it for a board that is already in BOOTSEL.
+    """
+    parts = []
+    target = "BOOTSEL" if bootsel else "application"
+    for force in (True, False):
+        cmd = picotool_reboot_cmd(exe, kind, bootsel, force=force)
+        rc, out = run_command(cmd, PICOTOOL_TIMEOUT)
+        parts.append("$ %s\n%s" % (shlex.join(cmd), out.rstrip()))
+        if rc == 0:
+            parts.append("picotool: reboot to %s OK" % target)
+            return "\n".join(parts)
+        low = out.lower()
+        if "unable to locate reset interface" in low:
+            parts.append(
+                "HINT: the running firmware has no picotool reset interface "
+                "(CircuitPython only exposes a CDC console). Power-cycle the "
+                "board or hold BOOTSEL while connecting it."
+            )
+            break
+        if "unable to connect" in low:
+            parts.append(
+                "HINT: picotool cannot access the USB device (permissions). "
+                "Add a udev rule for VID 2e8a and re-login."
+            )
+            break
+    raise FlashError("\n".join(parts) +
+                     "\nERROR: picotool reboot to %s failed" % target)
+
+
 def is_uf2(path: str) -> bool:
     try:
         if os.path.getsize(path) % 512 != 0:
@@ -1205,6 +1257,56 @@ class RPApp:
             "log": result["log"][-LOG_TAIL:],
         }
 
+    # -- reset -------------------------------------------------------------
+    def reset(self, req: dict):
+        """POST /reset: reboot via the picotool reset interface.
+
+        mode=run (default): reboot into the application.
+        mode=bootsel:       reboot into BOOTSEL mode.
+
+        The serial console session is not preempted; the relay's auto-rescan
+        keeps it alive across the reboot.
+        """
+        mode = str(req.get("mode", "run") or "run").strip().lower()
+        if mode in ("run", "app", "application", "reset"):
+            bootsel = False
+            target = "run"
+        elif mode in ("bootsel", "usb", "boot", "bootloader"):
+            bootsel = True
+            target = "bootsel"
+        else:
+            raise BadRequest("'mode' must be run (application) or bootsel")
+
+        if not self.picotool:
+            return 500, {"ok": False,
+                         "error": "picotool not found (set --picotool or PICOTOOL)"}
+        if not self.flash_lock.acquire(blocking=False):
+            return 409, {"ok": False, "error": "flash already running, retry later"}
+
+        t0 = time.time()
+        ok = False
+        try:
+            log_out = picotool_reset(self.picotool, self.picotool_kind, bootsel)
+            ok = True
+        except FlashError as exc:
+            log_out = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            log_out = "unexpected reset error: %r" % exc
+            if VERBOSE:
+                traceback.print_exc()
+        finally:
+            self.flash_lock.release()
+
+        elapsed = round(time.time() - t0, 1)
+        log("reset via HTTP: mode=%s ok=%s in %.1fs" % (target, ok, elapsed))
+        return (200 if ok else 500), {
+            "ok": ok,
+            "mode": target,
+            "elapsed_s": elapsed,
+            "tool": self.picotool or None,
+            "log": log_out[-LOG_TAIL:],
+        }
+
 
 class RelayHTTPHandler(BaseHTTPRequestHandler):
     app = None
@@ -1258,18 +1360,26 @@ class RelayHTTPHandler(BaseHTTPRequestHandler):
                 "name": NAME,
                 "role": self.app.role,
                 "version": VERSION,
-                "endpoints": {"GET /health": "status", "POST /flash": "flash a firmware"},
+                "endpoints": {
+                    "GET /health": "status",
+                    "POST /flash": "flash a firmware",
+                    "POST /reset": "reset the board (mode: run|bootsel)",
+                },
             })
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/flash":
+        if path == "/flash":
+            handler = self.app.flash
+        elif path == "/reset":
+            handler = self.app.reset
+        else:
             self._json(404, {"ok": False, "error": "not found"})
             return
         try:
-            code, obj = self.app.flash(self._read_json())
+            code, obj = handler(self._read_json())
         except BadRequest as exc:
             code, obj = 400, {"ok": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001

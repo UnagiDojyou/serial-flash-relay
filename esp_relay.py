@@ -18,8 +18,10 @@ Two services in one process (pure stdlib, Linux only):
      (replug, native-USB ESP32 re-enumeration) the relay waits for the
      same path to come back and keeps the TCP session alive.
 
-  2. HTTP FLASH API  http://127.0.0.1:8000  (auto-increments; paired with TCP)
+  2. HTTP FLASH / RESET API  http://127.0.0.1:8000
+     (auto-increments; paired with TCP)
        GET  /health
+       POST /reset  {"mode": "run"}      # run | download
        POST /flash
          {
            "images": [{"address": "0x1000", "file": "/abs/bootloader.bin"},
@@ -94,7 +96,7 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_TCP = 4000
 DEFAULT_HTTP = 8000
@@ -335,30 +337,43 @@ def set_dtr_rts(fd: int, dtr: bool, rts: bool) -> bool:
         return False
 
 
-def reset_download(fd: int) -> None:
-    """esptool UnixTightReset: enter the ROM download mode."""
+def reset_download(fd: int) -> bool:
+    """esptool UnixTightReset: enter the ROM download mode.
+
+    Returns False when DTR/RTS control is unavailable.
+    """
     log("reset: DOWNLOAD mode (UnixTightReset sequence)")
     if not set_dtr_rts(fd, False, False):
-        return
+        return False
     time.sleep(0.02)
-    set_dtr_rts(fd, True, True)
+    if not set_dtr_rts(fd, True, True):
+        return False
     time.sleep(0.02)
-    set_dtr_rts(fd, False, True)   # IO0=HIGH, EN=LOW (chip in reset)
+    if not set_dtr_rts(fd, False, True):   # IO0=HIGH, EN=LOW (chip in reset)
+        return False
     time.sleep(0.10)
-    set_dtr_rts(fd, True, False)   # IO0=LOW, EN=HIGH (boot from ROM)
+    if not set_dtr_rts(fd, True, False):   # IO0=LOW, EN=HIGH (boot from ROM)
+        return False
     time.sleep(0.05)
-    set_dtr_rts(fd, False, False)  # IO0=HIGH
+    if not set_dtr_rts(fd, False, False):  # IO0=HIGH
+        return False
     time.sleep(0.10)
+    return True
 
 
-def reset_run(fd: int) -> None:
-    """esptool HardReset: reboot into the application."""
+def reset_run(fd: int) -> bool:
+    """esptool HardReset: reboot into the application.
+
+    Returns False when DTR/RTS control is unavailable.
+    """
     log("reset: APP mode (HardReset sequence)")
     if not set_dtr_rts(fd, False, True):  # EN=LOW
-        return
+        return False
     time.sleep(0.10)
-    set_dtr_rts(fd, False, False)         # EN=HIGH
+    if not set_dtr_rts(fd, False, False):  # EN=HIGH
+        return False
     time.sleep(0.20)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +918,7 @@ class EspApp:
         self.flash_lock = threading.Lock()
         self.http_port = None
         self.tcp_port = None
+        self.serial_enabled = True
 
     def health(self) -> dict:
         serial_active, flash_busy = Runtime.snapshot()
@@ -1075,6 +1091,56 @@ class EspApp:
             "log": out[-LOG_TAIL:],
         }
 
+    # -- reset -------------------------------------------------------------
+    def reset(self, req: dict):
+        """POST /reset: send the DTR/RTS reset sequence.
+
+        The console session is NOT preempted: a connected client keeps the
+        session and sees the boot output.  A concurrent flash is refused
+        (the reset would fight esptool).
+        """
+        mode = str(req.get("mode", "run") or "run").strip().lower()
+        if mode in ("run", "app", "application", "console", "reset"):
+            action = "run"
+        elif mode in ("download", "flash", "boot", "bootloader"):
+            action = "download"
+        else:
+            raise BadRequest("'mode' must be run (application) or download")
+
+        if not self.serial_enabled:
+            return 503, {"ok": False,
+                         "error": "serial relay disabled (--no-serial)"}
+        if not self.flash_lock.acquire(blocking=False):
+            return 409, {"ok": False, "error": "flash already running, retry later"}
+        try:
+            serial_active, _ = Runtime.snapshot()
+            with self.state.lock:
+                # With a live console session, do not close/reopen the node
+                # behind the bridge's dup'd fd; only open it if it is absent.
+                if serial_active:
+                    if self.state.fd < 0 and not self.state.try_open_locked():
+                        return 503, {"ok": False,
+                                     "error": "serial port not available"}
+                elif not self.state.ensure_ready():
+                    return 503, {"ok": False, "error": "serial port not available"}
+                fd = self.state.fd
+                port = self.state.path
+                ok = reset_run(fd) if action == "run" else reset_download(fd)
+        finally:
+            self.flash_lock.release()
+
+        if not ok:
+            return 500, {"ok": False,
+                         "error": "DTR/RTS control unavailable; reset the board "
+                                  "manually or use an adapter with line control"}
+        log("reset requested via HTTP: %s (%s)" % (action, port))
+        return 200, {
+            "ok": True,
+            "mode": action,
+            "port": port,
+            "message": "reset sequence sent (%s)" % action,
+        }
+
 
 class RelayHTTPHandler(BaseHTTPRequestHandler):
     app = None
@@ -1128,18 +1194,26 @@ class RelayHTTPHandler(BaseHTTPRequestHandler):
                 "name": NAME,
                 "role": self.app.role,
                 "version": VERSION,
-                "endpoints": {"GET /health": "status", "POST /flash": "flash a firmware"},
+                "endpoints": {
+                    "GET /health": "status",
+                    "POST /flash": "flash a firmware",
+                    "POST /reset": "reset the board (mode: run|download)",
+                },
             })
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/flash":
+        if path == "/flash":
+            handler = self.app.flash
+        elif path == "/reset":
+            handler = self.app.reset
+        else:
             self._json(404, {"ok": False, "error": "not found"})
             return
         try:
-            code, obj = self.app.flash(self._read_json())
+            code, obj = handler(self._read_json())
         except BadRequest as exc:
             code, obj = 400, {"ok": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001
@@ -1336,6 +1410,7 @@ def main(argv=None) -> None:
     app = EspApp(state, esptool=esptool, version=version,
                  default_chip=default_chip, flash_wait=args.flash_wait,
                  started=started)
+    app.serial_enabled = not args.no_serial
 
     # Start the HTTP API first: a missing serial device must not prevent
     # flashing (esptool opens the port itself).  The TCP relay socket and

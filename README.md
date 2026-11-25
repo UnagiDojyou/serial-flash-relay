@@ -6,8 +6,9 @@ ESP32 / ESP8266 / ESP8285 と RP2040 / RP2350（Raspberry Pi Pico 系）のた�
 
 - **シリアルリレー**: USB シリアル（`/dev/ttyUSB*` / `/dev/ttyACM*`）を
   TCP（既定は `127.0.0.1`）に中継する。コンソール監視や esptool からの利用に。
-- **HTTP 書き込み API**: ホスト側で esptool / picotool を実行して書き込む。
-  サンドボックスや別マシンから `curl` 1 発で書き込みできる。
+- **HTTP 書き込み・リセット API**: ホスト側で esptool / picotool を実行して
+  書き込む。DTR/RTS または picotool 経由のリセットも HTTP から実行できる。
+  サンドボックスや別マシンから `curl` 1 発で操作できる。
 
 ```text
   ┌────────────────────┐  TCP 4000+            ┌──────────────────────┐   USB   ┌────────────┐
@@ -93,6 +94,11 @@ curl -sS -X POST http://127.0.0.1:8000/flash \
 curl -sS -X POST http://127.0.0.1:8000/flash \
   -H 'Content-Type: application/json' \
   -d '{"merged": "/abs/path/merged.bin"}'
+
+# リセット（アプリ起動）
+curl -sS -X POST http://127.0.0.1:8000/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "run"}'
 ```
 
 - チップは既定で **auto**（esptool が自動判別）。ESP8266 を明示するときは
@@ -148,6 +154,14 @@ curl -sS http://127.0.0.1:8000/health
 curl -sS -X POST http://127.0.0.1:8000/flash \
   -H 'Content-Type: application/json' \
   -d '{"file": "/abs/path/firmware.uf2"}'
+
+# リセット（アプリ起動 / BOOTSEL）
+curl -sS -X POST http://127.0.0.1:8000/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "run"}'
+curl -sS -X POST http://127.0.0.1:8000/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "bootsel"}'
 ```
 
 `file` は **ホスト側で読めるパス**です（アップロードはしません）。
@@ -280,7 +294,7 @@ HTTP API を持たないため、ログの接頭辞だけに使われます。
 
 ## HTTP API
 
-`esp_relay.py` と `rp_relay.py` が提供します。`serial_relay.py` には
+ESP / RP リレーの HTTP API（書き込みとリセット）です。`serial_relay.py` には
 HTTP API はありません（TCP リレーのみ）。以下の例の `8000` は既定値です。
 起動ログの `flash API on ...` に出た HTTP ポートに読み替えてください。
 
@@ -341,6 +355,28 @@ RP 固有: `usb_serial`, `vid`, `picotool`, `picotool_kind`
 
 `dry_run` のときは `{"ok": true, "dry_run": true, "cmd": [...]}`。
 
+### `POST /reset`（ESP）
+
+DTR/RTS を使って基板をリセットします。TCP 接続時のリセットと同じシーケンスです。
+
+| フィールド | 既定 | 説明 |
+|---|---|---|
+| `mode` | `run` | `run`（アプリ起動）/ `download`（ROM ダウンロードモード） |
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/reset \
+  -H 'Content-Type: application/json' -d '{"mode":"run"}'
+# -> {"ok":true,"mode":"run","port":"/dev/ttyUSB0",
+#     "message":"reset sequence sent (run)"}
+```
+
+- コンソール接続中でも実行できます。セッションは切断されず、リセット後の
+  起動ログがそのまま流れます。
+- 書き込み中は 409。DTR/RTS を制御できないアダプタでは 500。
+- `--no-serial` で起動している場合は 503 です。
+- `download` は ROM ダウンロードモードに入ったままになります。アプリに戻すには
+  `run` を送るか、書き込みを行ってください。
+
 ### `POST /flash`（RP）
 
 | フィールド | 既定 | 説明 |
@@ -366,17 +402,41 @@ RP 固有: `usb_serial`, `vid`, `picotool`, `picotool_kind`
 }
 ```
 
+### `POST /reset`（RP）
+
+picotool の reset interface 経由で RP2040 / RP2350 を再起動します。
+
+| フィールド | 既定 | 説明 |
+|---|---|---|
+| `mode` | `run` | `run`（アプリ起動）/ `bootsel`（BOOTSEL モードへ） |
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/reset \
+  -H 'Content-Type: application/json' -d '{"mode":"run"}'
+# -> {"ok":true,"mode":"run","elapsed_s":1.2,"tool":"...","log":"..."}
+```
+
+- `mode=bootsel` は BOOTSEL に入れて RPI-RP2 ドライブを出します。storage 書き込みの
+  前準備に使えます。
+- シリアルポートは不要です（`--no-serial` でも使用可）。コンソール接続中でも
+  実行でき、reboot 後は auto-rescan で TCP セッションが継続します。
+- 実行中のファームウェアが picotool reset interface を持たない場合
+  （CircuitPython など）は 500。電源再投入または BOOTSEL 接続を使ってください。
+- 書き込み中は 409。
+
 ### ステータスコード
 
 | コード | 意味 |
 |---|---|
-| 200 | 成功（`dry_run` 含む） |
-| 400 | JSON / フィールド / ファイルパス / アドレスの不正 |
-| 409 | 書き込みが既に実行中（ESP はコンソールがポートを解放しない場合も） |
-| 500 | 書き込みツールの失敗（ログに詳細） |
+| 200 | 成功（`dry_run`・`/reset` 含む） |
+| 400 | JSON / フィールド / ファイルパス / アドレス / `mode` の不正 |
 | 404 | 不明なパス |
+| 409 | 書き込み・リセットが既に実行中（ESP はコンソールがポートを解放しない場合も） |
+| 500 | 書き込み / リセットツールの失敗、DTR/RTS 非対応（ログに詳細） |
+| 503 | ESP の `/reset` でシリアルポートが使えない / `--no-serial` |
 
-タイムアウトは `500` + `exit_code: 124`（ESP）またはログ内 `TIMEOUT` で返ります。
+タイムアウトは `500` + `exit_code: 124`（ESP の書き込み）またはログ内
+`TIMEOUT` で返ります。
 
 ## TCP プロトコル
 
@@ -400,7 +460,8 @@ UART には流しません。ESP / RP のリレーはどちらも、プレフィ
 のような分割でも UART に漏れません）。
 
 その後は双方向の透過ブリッジです。TCP 側から DTR/RTS は操作できないため、
-ESP のリセットは**接続時のリレー側シーケンス**で行います。esptool を TCP
+ESP のリセットは**接続時のリレー側シーケンス**で行います（HTTP の
+`POST /reset` からも同じシーケンスを実行できます）。esptool を TCP
 経由で使う場合は、このリセット前提になります（ホスト側の HTTP API を使う方が
 確実です）。`serial_relay.py` はこのプレフィックスプロトコルを使わず、
 接続直後から全バイトを透過転送します（リセットもなし）。
@@ -468,6 +529,10 @@ USBIP/vhci では死んだ tty fd が `select()` で永久にブロックし、E
   udev の固定リンクを使ってください。
 - TCP ブリッジ経由では DTR/RTS を操作できません。ESP ではリレーが接続時に
   1 回だけリセットします。リセット不要な配線では `--reset none`。
+- HTTP の `/reset`（ESP）は DTR/RTS 制御が必要です。DTR/RTS が配線されていない
+  アダプタ（RP2040 ブリッジ越しの ESP8285 など）では 500 になります。
+- HTTP の `/reset`（RP）は picotool の reset interface が必要です。
+  CircuitPython など対応していない FW では使えません（電源再投入 / BOOTSEL）。
 - RP2040 / RP2350 の `storage` は BOOTSEL 状態が必要です。自動マウントされて
   いない環境では `sudo -n mount` を試みます（パスワード入力はできません）。
   書き込み先が本当に BOOTSEL ドライブ（`RPI-RP2` / `RP2350`）か
@@ -497,6 +562,9 @@ USBIP/vhci では死んだ tty fd が `select()` で永久にブロックし、E
 | BOOTSEL ドライブが見つからない | `RPI-RP2` / `RP2350` の自動マウントか `lsblk` を確認。リレーは `INFO_UF2.TXT` で判定 |
 | USBIP で転送が完全に死んでいる | サーバ側で USB 抜き差し / `usbip detach` → `attach` |
 | DTR/RTS リセットが効かない | `--reset none` にして手動リセット、または配線を確認 |
+| `/reset` が 500（ESP） | DTR/RTS を制御できるアダプタか確認。無ければ手動リセット |
+| `/reset` が 500（RP） | picotool reset interface 非対応。電源再投入 / BOOTSEL |
+| `/reset` が 503（ESP） | `--no-serial` で起動している。シリアル有効で再起動 |
 
 picotool 用 udev ルール（一度だけ）:
 
